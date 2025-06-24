@@ -1,5 +1,7 @@
 from sage.all import *
 from collections import defaultdict
+# from itertools import groupby
+from functools import cache
 
 def gen_polys(R, deg):
     """
@@ -13,7 +15,7 @@ def gen_polys(R, deg):
         Generator[Polynomial]: Polynomials of the form x^deg + ... + cx.
     """
     x = R.gen()
-    return (x**deg + x * poly for poly in R.polynomials(max_degree=deg-Integer(2)))
+    return (x**deg + x * poly for poly in R.polynomials(max_degree=deg-2))
 
 def num_equiv_classes(p, r, n): 
     """
@@ -30,14 +32,14 @@ def num_equiv_classes(p, r, n):
     """
     q = p**r
 
-    if p % n == Integer(0):
-        c = Integer(1) - q**(n-Integer(2)) + q**(n/p - Integer(1))
-    elif n == Integer(1):
-        c = Integer(1)
+    if n % p == 0:
+        c = 1 - q**(n-2) + q**(n//p - 1)
+    elif n == 1:
+        c = 1
     else:
-        c = Integer(1) - q**(n-Integer(2))
+        c = 1 - q**(n-2)
     
-    return Integer(1)/(q-Integer(1)) * sum(euler_phi(d)*(q**(ceil(n/d)-Integer(1))-Integer(1)) for d in divisors(q-Integer(1)) if d < n) + c
+    return sum(euler_phi(d)*(q**(ceil(n/d)-1)-1) for d in divisors(q-1) if d < n) // (q-1) + c
 
 def weight(n, p):
     """
@@ -50,13 +52,13 @@ def weight(n, p):
     Returns:
         Integer: The p-weight of n.
     """
-    w = Integer(0)
-    while n > Integer(0):
+    w = 0
+    while n > 0:
         w += n % p
         n //= p
     return w
 
-def part(f, w, p):
+def wpart(f, w, p):
     """
     Extracts the terms in f of p-weight w.
 
@@ -71,7 +73,7 @@ def part(f, w, p):
     x = f.variables()[0]
     return sum(c * x**i for i, c in enumerate(f) if weight(i, p) == w)
 
-def part_ge(f, w, p):
+def wpart_ge(f, w, p):
     """
     Extracts the terms in f of p-weight >= w.
 
@@ -86,6 +88,15 @@ def part_ge(f, w, p):
     x = f.variables()[0]
     return sum(c * x**i for i, c in enumerate(f) if weight(i, p) >= w)
 
+def dpart(f, d):
+    x = f.variables()[0]
+    return f[d] * x**d
+
+def dpart_ge(f, d):
+    x = f.variables()[0]
+    R = f.parent()
+    return R(f[d:]) * x**d
+
 def pdeg(f, p):
     """
     Computes the p-weight degree of a polynomial f.
@@ -99,7 +110,7 @@ def pdeg(f, p):
     """
     return max((i for (i, c) in enumerate(f) if c != Integer(0)), key=lambda x: (weight(x, p), x))
 
-AGL = None
+AGL = []
 
 def initialize_AGL(R):
     """
@@ -121,7 +132,7 @@ def initialize_AGL(R):
     F = R.base_ring()
     AGL = [a*x + b for a in F if a != F(0) for b in F]
 
-def canonical_form(f):
+def canonical_form(f, return_elements=False):
     """
     Computes the canonical form of a polynomial f under AGL-equivalence.
 
@@ -130,24 +141,123 @@ def canonical_form(f):
 
     Returns:
         Polynomial: The canonical form of f.
+        Set[Polynomial]: AGL elements to bring f to its canonical form.
     """
     p = f.base_ring().characteristic()
     d = pdeg(f, p)
     f /= f[d]
-    f -= f[Integer(0)]
+    f -= f[0]
     K = weight(d, p)
 
     form = Integer(0)
     f_partial = Integer(0)
-    f_parts = [part(f, i, p) for i in range(K + Integer(1))]
+    f_parts = [wpart(f, i, p) for i in range(K + 1)]
 
     candidates = AGL
-    for k in range(K, Integer(0), -Integer(1)):
+    for k in range(K, 0, -1):
         f_partial += f_parts[k]
         g_options = defaultdict(list)
         for poly in candidates:
-            g_options[part(poly[Integer(1)]**(-d) * f_partial(poly), k, p)].append(poly)
+            g_options[wpart(poly[1]**(-d) * f_partial(poly), k, p)].append(poly)
         maximal = min(g_options)
         form += maximal
         candidates = g_options[maximal]
-    return form
+        print(candidates)
+    return form if not return_elements else (form, candidates)
+
+@cache
+def coset_representatives(l, prim):
+    return set(prim**i for i in range(l))
+
+def continue_form(f, n, i, prim):
+    if i == 0:
+        return
+
+    d = f.degree()
+    x = f.parent().gen()
+    q = len(f.base_ring())
+
+    if n is None:
+        n = gcd([d - j for j, c in enumerate(f) if c != Integer(0)] + [q - 1])
+
+    l = gcd((q - 1) // n * (d - i), q - 1)
+    reps = coset_representatives(l, prim)
+    forms = set((f + c * x**i, gcd(n, d - i)) for c in reps) | { (f, n) }
+
+    global canonical_forms, should_print_progress
+    canonical_forms |= set(form[0] for form in forms)
+    if should_print_progress:
+        print(f"number of canonical forms found: {len(canonical_forms)}", end="\r")
+    
+    for form in forms:
+        continue_form(form[0], form[1], i - 1, prim)
+
+def start_form(f, n, i, fixer, prim):
+    if i == 0:
+        return
+    elif set(a[0] for a in fixer) == { 0 }:
+        continue_form(f, None, i, prim)
+    else:
+        x = f.parent().gen()
+        F = f.base_ring()
+        d = f.degree()
+
+        polys = set(a*(x**i) for a in F)
+        reps = set()
+        while len(polys) > 0:
+            g = polys.pop()
+            orbit = set(dpart(alpha[1]**(-d) * f(alpha), i) + alpha[1]**(-d) * g(alpha[1]*x) for alpha in fixer)
+            rep = min(orbit)
+            reps.add(rep)
+            polys -= orbit
+
+        global canonical_forms, should_print_progress
+        canonical_forms |= set(f + rep for rep in reps)
+        if should_print_progress:
+            print(f"number of canonical forms found: {len(canonical_forms)}", end="\r")
+
+        for rep in reps:
+            start_form(f + rep, n, i - 1, set(alpha for alpha in fixer if dpart(alpha[1]**(-d) * (f + rep)(alpha), i) == rep), prim)
+
+canonical_forms = set()
+should_print_progress = False
+
+def enumerate_canonical_forms(deg, R, print_progress=False):
+    x = R.gen()
+    F = R.base_ring()
+    prim = F.primitive_element()
+    q = len(F)
+
+    global canonical_forms, should_print_progress
+    canonical_forms = { x**deg }
+    should_print_progress = print_progress
+    if should_print_progress:
+        print(f"number of canonical forms found: {len(canonical_forms)}", end="\r")
+
+    start_form(x**deg, q - 1, deg - 1, AGL, prim)
+    if should_print_progress:
+        print()  # move past carriage return
+    return canonical_forms
+
+def differential_uniformity(f, upper_bound=Infinity):
+    """
+    Computes the differential uniformity of a polynomial f.
+
+    Arguments:
+        f (Polynomial): A polynomial over a finite field.
+
+    Returns:
+        int: The differential uniformity of f.
+    """
+    F = f.base_ring()
+    maximum = Integer(0)
+    for a in F:
+        if a != 0:
+            counts = defaultdict(Integer)
+            for x in F:
+                b = f(x + a) - f(x)
+                counts[b] += 1
+            maximum = max(maximum, max(counts.values()))
+            if maximum > upper_bound:
+                return maximum
+    return maximum
